@@ -21,7 +21,7 @@ export default function App() {
       case 'orders':
         return <OrderList />;
       case 'catalog':
-        return <Catalog />;
+        return <Catalog onNavigate={(tab) => setActiveTab(tab)} />;
       case 'inventory':
         return <Inventory />;
       case 'sheets':

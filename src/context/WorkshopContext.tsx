@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
-import { Order, CatalogItem, OrderStatus } from '../types';
+import { Order, CatalogItem, OrderStatus, Material } from '../types';
 import { MOCK_ORDERS, MOCK_CATALOG, MOCK_INVENTORY } from '../constants';
 import { 
   InventoryItem, 
@@ -10,6 +10,9 @@ import {
   getSavedSpreadsheetTitle, 
   getLastSyncTime, 
   readAllFromGoogleSheets, 
+  readCatalogFromGoogleSheets,
+  saveCatalogSheetName,
+  getSavedCatalogSheetName,
   syncAllToGoogleSheets, 
   createJewelMasterSpreadsheet, 
   saveSpreadsheetInfo, 
@@ -43,6 +46,7 @@ interface WorkshopContextType {
   spreadsheetTitle: string | null;
   spreadsheetUrl: string | null;
   isConnectedToSheets: boolean;
+  catalogSheetName: string | null;
 
   // Actions - Google Auth & Sheets
   signIn: () => Promise<void>;
@@ -52,9 +56,26 @@ interface WorkshopContextType {
   disconnectSheet: () => void;
   syncToSheets: () => Promise<void>;
   pullFromSheets: () => Promise<void>;
+  pullCatalogFromSheets: (customSheetName?: string) => Promise<void>;
+  setCatalogSheet: (sheetName: string) => void;
 
   // Actions - Orders
   addOrder: (order: Partial<Order>) => Promise<Order>;
+  createOrderFromCatalogItem: (
+    item: CatalogItem,
+    options: {
+      clientName: string;
+      clientPhone: string;
+      deadline?: string;
+      totalAmount?: number;
+      advance?: number;
+      notes?: string;
+      description?: string;
+      size?: string;
+      metal?: string;
+      weight?: number;
+    }
+  ) => Promise<Order>;
   updateOrder: (id: string, updates: Partial<Order>) => Promise<void>;
   deleteOrder: (id: string) => Promise<void>;
 
@@ -84,6 +105,7 @@ export const WorkshopProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [hasToken, setHasToken] = useState<boolean>(false);
   const [spreadsheetId, setSpreadsheetId] = useState<string | null>(getSavedSpreadsheetId());
   const [spreadsheetTitle, setSpreadsheetTitle] = useState<string | null>(getSavedSpreadsheetTitle());
+  const [catalogSheetName, setCatalogSheetNameState] = useState<string | null>(getSavedCatalogSheetName());
   const [lastSyncTime, setLastSyncTime] = useState<string | null>(getLastSyncTime());
 
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
@@ -95,6 +117,12 @@ export const WorkshopProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const dismissError = () => {
     setSyncError(null);
     setIsPopupBlocked(false);
+  };
+
+  const setCatalogSheet = (sheetName: string) => {
+    setCatalogSheetNameState(sheetName);
+    saveCatalogSheetName(sheetName);
+    pullCatalogFromSheets(sheetName);
   };
 
   const syncTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -301,6 +329,25 @@ export const WorkshopProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
   };
 
+  const pullCatalogFromSheets = async (customSheetName?: string) => {
+    try {
+      setIsLoading(true);
+      setSyncError(null);
+      const freshCatalog = await readCatalogFromGoogleSheets(spreadsheetId || undefined, customSheetName);
+      if (freshCatalog.length > 0) {
+        setCatalog(freshCatalog);
+        showToast(`Завантажено ${freshCatalog.length} моделей з Google Таблиці`);
+      } else {
+        showToast('Аркуш перевірено: нових моделей не виявлено');
+      }
+    } catch (err: any) {
+      setSyncError(err.message || 'Помилка завантаження каталогу з таблиці');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   // Orders CRUD
   const addOrder = async (newOrderData: Partial<Order>): Promise<Order> => {
     const newOrder: Order = {
@@ -327,6 +374,76 @@ export const WorkshopProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const nextOrders = [newOrder, ...orders];
     setOrders(nextOrders);
     triggerAutoSync(nextOrders, catalog, inventory);
+    return newOrder;
+  };
+
+  const createOrderFromCatalogItem = async (
+    item: CatalogItem,
+    options: {
+      clientName: string;
+      clientPhone: string;
+      deadline?: string;
+      totalAmount?: number;
+      advance?: number;
+      notes?: string;
+      description?: string;
+      size?: string;
+      metal?: string;
+      weight?: number;
+    }
+  ): Promise<Order> => {
+    const materials: Material[] = [];
+    if (options.metal || options.weight || item.metal || item.weight) {
+      materials.push({
+        id: `mat-${Date.now()}`,
+        name: options.metal || item.metal || (item.baseMaterials[0]?.name || 'Золото 585'),
+        weight: options.weight || item.weight || (item.baseMaterials[0]?.weight || 3.5),
+        unit: 'g',
+        type: 'metal',
+      });
+    } else if (item.baseMaterials && item.baseMaterials.length > 0) {
+      materials.push(...item.baseMaterials);
+    }
+
+    const calculatedTotal = options.totalAmount !== undefined && options.totalAmount > 0
+      ? options.totalAmount
+      : (item.price || item.baseLaborCost || 3500);
+
+    const fullNotes = [
+      options.size ? `Розмір: ${options.size}` : '',
+      `Модель: ${item.modelId || item.name}`,
+      options.notes ? options.notes : '',
+    ].filter(Boolean).join(' | ');
+
+    const newOrder: Order = {
+      id: `ord-${Date.now()}`,
+      orderNumber: `ORD-${new Date().getFullYear()}-${String(orders.length + 1).padStart(3, '0')}`,
+      itemName: item.name || 'Ювелірний виріб за каталогом',
+      clientName: options.clientName || 'Клієнт',
+      clientPhone: options.clientPhone || '',
+      status: OrderStatus.ACCEPTED,
+      deadline: options.deadline || new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0],
+      totalAmount: calculatedTotal,
+      advance: options.advance || 0,
+      materials,
+      photos: item.photos && item.photos.length > 0 ? [...item.photos] : [],
+      payments: (options.advance && options.advance > 0) ? [{
+        id: `pay-${Date.now()}`,
+        amount: options.advance,
+        date: new Date().toISOString().split('T')[0],
+        method: 'cash',
+      }] : [],
+      expenses: [],
+      description: options.description || item.description || `Замовлення за моделлю ${item.modelId}`,
+      notes: fullNotes,
+      createdAt: new Date().toISOString(),
+      catalogItemId: item.id,
+    };
+
+    const nextOrders = [newOrder, ...orders];
+    setOrders(nextOrders);
+    triggerAutoSync(nextOrders, catalog, inventory);
+    showToast(`Замовлення #${newOrder.orderNumber} успішно створено та синхронізовано!`);
     return newOrder;
   };
 
@@ -442,6 +559,7 @@ export const WorkshopProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         spreadsheetTitle,
         spreadsheetUrl,
         isConnectedToSheets: !!spreadsheetId,
+        catalogSheetName,
         signIn,
         signOut,
         createSheet,
@@ -449,7 +567,10 @@ export const WorkshopProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         disconnectSheet,
         syncToSheets,
         pullFromSheets,
+        pullCatalogFromSheets,
+        setCatalogSheet,
         addOrder,
+        createOrderFromCatalogItem,
         updateOrder,
         deleteOrder,
         addCatalogItem,

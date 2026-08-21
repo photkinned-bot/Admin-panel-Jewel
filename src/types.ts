@@ -64,4 +64,22 @@ export interface CatalogItem {
   photos: Photo[];
   baseLaborCost: number;
   complexity: 'LOW' | 'MEDIUM' | 'HIGH';
+  weight?: number;
+  metal?: string;
+  price?: number;
+  category?: string;
 }
+
+export interface OrderFromCatalogOptions {
+  clientName: string;
+  clientPhone: string;
+  deadline?: string;
+  totalAmount?: number;
+  advance?: number;
+  notes?: string;
+  description?: string;
+  size?: string;
+  metal?: string;
+  weight?: number;
+}
+

@@ -38,6 +38,7 @@ const STORAGE_KEYS = {
   LOCAL_ORDERS: 'jewelmaster_local_orders',
   LOCAL_CATALOG: 'jewelmaster_local_catalog',
   LOCAL_INVENTORY: 'jewelmaster_local_inventory',
+  CATALOG_SHEET_NAME: 'jewelmaster_catalog_sheet_name',
 };
 
 export const getSavedSpreadsheetId = (): string | null => {
@@ -52,6 +53,14 @@ export const getLastSyncTime = (): string | null => {
   return localStorage.getItem(STORAGE_KEYS.LAST_SYNC);
 };
 
+export const getSavedCatalogSheetName = (): string | null => {
+  return localStorage.getItem(STORAGE_KEYS.CATALOG_SHEET_NAME);
+};
+
+export const saveCatalogSheetName = (name: string) => {
+  localStorage.setItem(STORAGE_KEYS.CATALOG_SHEET_NAME, name);
+};
+
 export const saveSpreadsheetInfo = (id: string, title?: string) => {
   localStorage.setItem(STORAGE_KEYS.SPREADSHEET_ID, id);
   if (title) localStorage.setItem(STORAGE_KEYS.SPREADSHEET_TITLE, title);
@@ -62,6 +71,7 @@ export const clearSpreadsheetInfo = () => {
   localStorage.removeItem(STORAGE_KEYS.SPREADSHEET_ID);
   localStorage.removeItem(STORAGE_KEYS.SPREADSHEET_TITLE);
   localStorage.removeItem(STORAGE_KEYS.LAST_SYNC);
+  localStorage.removeItem(STORAGE_KEYS.CATALOG_SHEET_NAME);
 };
 
 // Local storage caching for offline/instant speed
@@ -146,18 +156,88 @@ function safeJsonStringify(obj: any): string {
   }
 }
 
-function safeJsonParse<T>(str: string, fallback: T): T {
+function safeJsonParse<T>(str: any, fallback: T): T {
   if (!str) return fallback;
+  if (typeof str === 'object') return str as T;
   try {
     const parsed = JSON.parse(str);
     return parsed !== undefined ? parsed : fallback;
   } catch {
-    // If it's a plain string list separated by commas or semicolons
     if (typeof fallback === 'object' && Array.isArray(fallback) && typeof str === 'string' && str.trim()) {
       return str.split(';').map(item => ({ name: item.trim() })) as unknown as T;
     }
     return fallback;
   }
+}
+
+/**
+ * Normalizes any photo URL from Google Sheets, including:
+ * - Google Drive share links (drive.google.com/file/d/..., drive.google.com/open?id=...)
+ * - Formulas like =IMAGE("https://...")
+ * - JSON strings like [{"url": "..."}]
+ * - Direct image URLs and base64 strings
+ */
+export function normalizeImageUrl(input: any): string {
+  if (!input) return '';
+  let str = String(input).trim();
+
+  // Strip formula wrapper =IMAGE("...") or =IMAGE('...')
+  const formulaMatch = str.match(/=IMAGE\s*\(\s*["']([^"']+)["']\s*\)/i);
+  if (formulaMatch && formulaMatch[1]) {
+    str = formulaMatch[1].trim();
+  }
+
+  // Handle JSON array or object
+  if (str.startsWith('[') || str.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(str);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        if (typeof parsed[0] === 'string') return normalizeImageUrl(parsed[0]);
+        if (parsed[0]?.url) return normalizeImageUrl(parsed[0].url);
+      } else if (parsed?.url) {
+        return normalizeImageUrl(parsed.url);
+      }
+    } catch {
+      // Continue normal parsing
+    }
+  }
+
+  // Extract Google Drive File ID
+  // Examples:
+  // https://drive.google.com/file/d/1aB2cD3eFgHiJ/view?usp=sharing
+  // https://drive.google.com/open?id=1aB2cD3eFgHiJ
+  // https://drive.google.com/uc?id=1aB2cD3eFgHiJ
+  const driveFileMatch = str.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/i);
+  if (driveFileMatch && driveFileMatch[1]) {
+    return `https://lh3.googleusercontent.com/d/${driveFileMatch[1]}`;
+  }
+
+  const driveIdMatch = str.match(/drive\.google\.com\/(?:open|uc)\?(?:[a-zA-Z0-9_=&-]*&)?id=([a-zA-Z0-9_-]+)/i);
+  if (driveIdMatch && driveIdMatch[1]) {
+    return `https://lh3.googleusercontent.com/d/${driveIdMatch[1]}`;
+  }
+
+  // If it contains multiple URLs separated by newline or comma, take the first valid one
+  if (str.includes('\n') || (str.includes(',') && !str.startsWith('data:image'))) {
+    const parts = str.split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
+    if (parts.length > 0) {
+      return normalizeImageUrl(parts[0]);
+    }
+  }
+
+  return str;
+}
+
+/**
+ * Normalizes photo array for Catalog Item or Order
+ */
+export function normalizePhotosArray(input: any): Photo[] {
+  if (!input) return [];
+  if (Array.isArray(input)) {
+    return input.map(p => typeof p === 'string' ? { url: normalizeImageUrl(p) } : { ...p, url: normalizeImageUrl(p.url) }).filter(p => !!p.url);
+  }
+  const cleanUrl = normalizeImageUrl(input);
+  return cleanUrl ? [{ url: cleanUrl }] : [];
 }
 
 /**
@@ -274,35 +354,190 @@ async function ensureSheetsExist(spreadsheetId: string): Promise<void> {
 }
 
 /**
- * Reads all data directly from the Google Sheet
+ * Helper to match sheet titles dynamically
+ */
+function findSheetTitle(sheetTitles: string[], keywords: string[], defaultTitle: string): string {
+  for (const keyword of keywords) {
+    const found = sheetTitles.find(t => t.toLowerCase().includes(keyword.toLowerCase()));
+    if (found) return found;
+  }
+  return defaultTitle;
+}
+
+/**
+ * Helper to find column index by synonyms
+ */
+function findColIndex(headers: string[], synonyms: string[]): number {
+  for (let i = 0; i < headers.length; i++) {
+    const h = (headers[i] || '').toLowerCase().replace(/[^a-zа-яіїєґ0-9]/gi, '').trim();
+    for (const syn of synonyms) {
+      const s = syn.toLowerCase().replace(/[^a-zа-яіїєґ0-9]/gi, '').trim();
+      if (h === s || h.includes(s)) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+/**
+ * Parses Catalog rows with smart dynamic header detection
+ */
+function parseCatalogRows(rows: any[][]): CatalogItem[] {
+  if (!rows || rows.length < 2) return [];
+
+  const headerRow = rows[0] || [];
+  const headerStrings = headerRow.map(h => String(h || '').trim());
+
+  // Dynamically locate column indices
+  const idCol = findColIndex(headerStrings, ['id', 'ід']);
+  const modelIdCol = findColIndex(headerStrings, ['артикул', 'код', 'модель', 'article', 'modelid', 'sku', 'номер', 'код моделі']);
+  const nameCol = findColIndex(headerStrings, ['назва', 'назва моделі', 'найменування', 'виріб', 'назва виробу', 'name', 'title', 'item']);
+  const complexityCol = findColIndex(headerStrings, ['складність', 'категорія складності', 'complexity', 'рівень']);
+  const laborCostCol = findColIndex(headerStrings, ['базова вартість роботи', 'вартість роботи', 'ціна роботи', 'робота', 'вартість', 'ціна', 'price', 'cost', 'labor', 'laborcost']);
+  const materialsCol = findColIndex(headerStrings, ['базові матеріали', 'матеріали', 'метал', 'проба', 'сплав', 'materials', 'metal']);
+  const weightCol = findColIndex(headerStrings, ['вага', 'вагаг', 'вагавиробу', 'маса', 'вага металу', 'weight', 'mass']);
+  const descriptionCol = findColIndex(headerStrings, ['опис', 'опис моделі', 'характеристики', 'примітки', 'description', 'notes', 'details']);
+  const photoCol = findColIndex(headerStrings, ['фото', 'фото json', 'фотографія', 'зображення', 'картинка', 'посилання на фото', 'фото виробу', 'photo', 'image', 'picture', 'url', 'img']);
+  const categoryCol = findColIndex(headerStrings, ['категорія', 'тип', 'вид', 'category', 'type']);
+
+  const parsed: CatalogItem[] = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r || r.length === 0 || r.every(cell => !cell || String(cell).trim() === '')) continue;
+
+    // Fallbacks if columns weren't explicitly found by name
+    const rawId = idCol >= 0 ? r[idCol] : (modelIdCol >= 0 ? r[modelIdCol] : `cat-${i}`);
+    const rawModelId = modelIdCol >= 0 ? r[modelIdCol] : (idCol >= 0 ? r[idCol] : `MOD-${String(i).padStart(3, '0')}`);
+    const rawName = nameCol >= 0 ? r[nameCol] : (r[2] || r[1] || r[0] || `Модель ${i}`);
+    const rawDescription = descriptionCol >= 0 ? r[descriptionCol] : (r[6] || '');
+    
+    // Photo resolution
+    let photos: Photo[] = [];
+    if (photoCol >= 0 && r[photoCol]) {
+      photos = normalizePhotosArray(r[photoCol]);
+    } else if (r[7]) {
+      photos = normalizePhotosArray(r[7]);
+    } else {
+      // Check every cell for a possible image URL
+      for (const cell of r) {
+        if (cell && typeof cell === 'string' && (cell.includes('http') || cell.includes('drive.google') || cell.startsWith('data:image'))) {
+          photos = normalizePhotosArray(cell);
+          break;
+        }
+      }
+    }
+
+    // Default fallback placeholder photo if none found
+    if (photos.length === 0) {
+      photos = [{ url: 'https://images.unsplash.com/photo-1599643478518-a784e5dc4c8f?w=800&auto=format&fit=crop&q=80' }];
+    }
+
+    // Labor Cost & Price
+    let rawLaborCost = laborCostCol >= 0 ? Number(String(r[laborCostCol]).replace(/[^0-9.]/g, '')) : (Number(r[4]) || 3500);
+    if (isNaN(rawLaborCost) || rawLaborCost === 0) rawLaborCost = 3500;
+
+    // Materials / Metal / Weight
+    let rawWeight = weightCol >= 0 ? parseFloat(String(r[weightCol]).replace(/[^0-9.]/g, '')) || 0 : 0;
+    let rawMetal = materialsCol >= 0 ? String(r[materialsCol] || '') : 'Золото 585';
+    
+    let baseMaterials: Material[] = [];
+    if (materialsCol >= 0 && typeof r[materialsCol] === 'string' && (r[materialsCol].startsWith('[') || r[materialsCol].startsWith('{'))) {
+      baseMaterials = safeJsonParse<Material[]>(r[materialsCol], []);
+    } else if (rawMetal) {
+      baseMaterials = [{
+        id: `mat-${i}`,
+        name: rawMetal,
+        weight: rawWeight || 3.5,
+        unit: 'g',
+        type: 'metal'
+      }];
+    }
+
+    // Complexity
+    let complexity: 'LOW' | 'MEDIUM' | 'HIGH' = 'MEDIUM';
+    if (complexityCol >= 0 && r[complexityCol]) {
+      const cStr = String(r[complexityCol]).toUpperCase();
+      if (cStr.includes('HIGH') || cStr.includes('ВИСОК')) complexity = 'HIGH';
+      else if (cStr.includes('LOW') || cStr.includes('НИЗЬК')) complexity = 'LOW';
+      else complexity = 'MEDIUM';
+    }
+
+    parsed.push({
+      id: String(rawId || `cat-${i}`),
+      modelId: String(rawModelId || `MOD-${String(i).padStart(3, '0')}`),
+      name: String(rawName || 'Ювелірна модель'),
+      complexity,
+      baseLaborCost: rawLaborCost,
+      baseMaterials,
+      description: String(rawDescription || ''),
+      photos,
+      weight: rawWeight || (baseMaterials[0]?.weight || 0),
+      metal: rawMetal || (baseMaterials[0]?.name || 'Золото 585'),
+      price: rawLaborCost,
+      category: categoryCol >= 0 ? String(r[categoryCol] || '') : undefined,
+    });
+  }
+
+  return parsed;
+}
+
+/**
+ * Reads all data directly from the Google Sheet with dynamic sheet detection
  */
 export async function readAllFromGoogleSheets(spreadsheetId?: string): Promise<WorkshopData> {
   const targetId = spreadsheetId || getSavedSpreadsheetId();
   if (!targetId) throw new Error('Не вказано ID Google Таблиці');
 
-  await ensureSheetsExist(targetId);
+  // Fetch spreadsheet structure first to get actual sheet titles
+  const metaRes = await fetchWithAuth(`https://sheets.googleapis.com/v4/spreadsheets/${targetId}?includeGridData=false`);
+  let sheetTitles: string[] = [];
+  if (metaRes.ok) {
+    const meta = await metaRes.json();
+    sheetTitles = (meta.sheets || []).map((s: any) => s.properties?.title || '');
+  }
 
-  // Read all 3 main sheets in batch
+  // Match sheet names
+  const customCatalogTab = getSavedCatalogSheetName();
+  const catalogSheetTitle = customCatalogTab && sheetTitles.includes(customCatalogTab)
+    ? customCatalogTab
+    : findSheetTitle(sheetTitles, ['каталог', 'catalog', 'товари', 'моделі', 'вироби', 'прикраси', 'items', 'products', '💎'], '💎 Каталог');
+
+  const ordersSheetTitle = findSheetTitle(sheetTitles, ['замовлення', 'orders', 'order', 'заказы', '📋'], '📋 Замовлення');
+  const inventorySheetTitle = findSheetTitle(sheetTitles, ['склад', 'inventory', 'матеріали', 'materials', 'залишки', '📦'], '📦 Склад Матеріалів');
+
+  // Read sheets in batch
   const ranges = [
-    encodeURIComponent("'📋 Замовлення'!A1:P1000"),
-    encodeURIComponent("'💎 Каталог'!A1:J1000"),
-    encodeURIComponent("'📦 Склад Матеріалів'!A1:J1000"),
+    encodeURIComponent(`'${ordersSheetTitle}'!A1:P1000`),
+    encodeURIComponent(`'${catalogSheetTitle}'!A1:Z1000`),
+    encodeURIComponent(`'${inventorySheetTitle}'!A1:J1000`),
   ];
 
   const batchUrl = `https://sheets.googleapis.com/v4/spreadsheets/${targetId}/values:batchGet?ranges=${ranges.join('&ranges=')}`;
   const res = await fetchWithAuth(batchUrl);
 
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.error?.message || 'Не вдалося завантажити дані з Google Таблиці');
+  let ordersRows: any[][] = [];
+  let catalogRows: any[][] = [];
+  let inventoryRows: any[][] = [];
+
+  if (res.ok) {
+    const batchResponse = await res.json();
+    const valueRanges = batchResponse.valueRanges || [];
+    ordersRows = valueRanges[0]?.values || [];
+    catalogRows = valueRanges[1]?.values || [];
+    inventoryRows = valueRanges[2]?.values || [];
+  } else {
+    // If batch fails due to sheet name mismatch, try reading the first sheet as Catalog
+    if (sheetTitles.length > 0) {
+      const fallbackRange = encodeURIComponent(`'${sheetTitles[0]}'!A1:Z1000`);
+      const fallbackRes = await fetchWithAuth(`https://sheets.googleapis.com/v4/spreadsheets/${targetId}/values/${fallbackRange}`);
+      if (fallbackRes.ok) {
+        const fallbackData = await fallbackRes.json();
+        catalogRows = fallbackData.values || [];
+      }
+    }
   }
-
-  const batchResponse = await res.json();
-  const valueRanges = batchResponse.valueRanges || [];
-
-  const ordersRows: any[][] = valueRanges[0]?.values || [];
-  const catalogRows: any[][] = valueRanges[1]?.values || [];
-  const inventoryRows: any[][] = valueRanges[2]?.values || [];
 
   // Parse Orders
   const parsedOrders: Order[] = [];
@@ -312,7 +547,7 @@ export async function readAllFromGoogleSheets(spreadsheetId?: string): Promise<W
       if (!r || r.length === 0 || !r[0]) continue;
 
       const materials: Material[] = safeJsonParse<Material[]>(r[10], []);
-      const photos: Photo[] = safeJsonParse<Photo[]>(r[11], r[11] ? [{ url: r[11] }] : []);
+      const photos: Photo[] = normalizePhotosArray(r[11]);
       const payments: Payment[] = safeJsonParse<Payment[]>(r[14], []);
       const expenses: Expense[] = safeJsonParse<Expense[]>(r[15], []);
 
@@ -324,8 +559,8 @@ export async function readAllFromGoogleSheets(spreadsheetId?: string): Promise<W
         clientPhone: String(r[4] || ''),
         status: (r[5] as OrderStatus) || OrderStatus.ACCEPTED,
         deadline: String(r[6] || new Date().toISOString().split('T')[0]),
-        totalAmount: Number(r[7]) || 0,
-        advance: Number(r[8]) || 0,
+        totalAmount: Number(String(r[7]).replace(/[^0-9.]/g, '')) || 0,
+        advance: Number(String(r[8]).replace(/[^0-9.]/g, '')) || 0,
         materials,
         photos,
         description: String(r[12] || ''),
@@ -337,28 +572,8 @@ export async function readAllFromGoogleSheets(spreadsheetId?: string): Promise<W
     }
   }
 
-  // Parse Catalog
-  const parsedCatalog: CatalogItem[] = [];
-  if (catalogRows.length > 1) {
-    for (let i = 1; i < catalogRows.length; i++) {
-      const r = catalogRows[i];
-      if (!r || r.length === 0 || !r[0]) continue;
-
-      const baseMaterials: Material[] = safeJsonParse<Material[]>(r[5], []);
-      const photos: Photo[] = safeJsonParse<Photo[]>(r[7], r[7] ? [{ url: r[7] }] : []);
-
-      parsedCatalog.push({
-        id: String(r[0] || `cat-${i}`),
-        modelId: String(r[1] || `MOD-${i}`),
-        name: String(r[2] || 'Модель'),
-        complexity: (r[3] as 'LOW' | 'MEDIUM' | 'HIGH') || 'MEDIUM',
-        baseLaborCost: Number(r[4]) || 0,
-        baseMaterials,
-        description: String(r[6] || ''),
-        photos,
-      });
-    }
-  }
+  // Parse Catalog using smart dynamic parser
+  const parsedCatalog: CatalogItem[] = parseCatalogRows(catalogRows);
 
   // Parse Inventory
   const parsedInventory: InventoryItem[] = [];
@@ -393,6 +608,44 @@ export async function readAllFromGoogleSheets(spreadsheetId?: string): Promise<W
     inventory: parsedInventory,
   };
 }
+
+/**
+ * Reads only the Catalog from a specific Google Sheet tab
+ */
+export async function readCatalogFromGoogleSheets(spreadsheetId?: string, sheetName?: string): Promise<CatalogItem[]> {
+  const targetId = spreadsheetId || getSavedSpreadsheetId();
+  if (!targetId) throw new Error('Не вказано ID Google Таблиці');
+
+  let targetSheet = sheetName || getSavedCatalogSheetName();
+
+  if (!targetSheet) {
+    const metaRes = await fetchWithAuth(`https://sheets.googleapis.com/v4/spreadsheets/${targetId}?includeGridData=false`);
+    if (metaRes.ok) {
+      const meta = await metaRes.json();
+      const sheetTitles: string[] = (meta.sheets || []).map((s: any) => s.properties?.title || '');
+      targetSheet = findSheetTitle(sheetTitles, ['каталог', 'catalog', 'товари', 'моделі', 'вироби', 'прикраси', 'items', 'products', '💎'], sheetTitles[0] || '💎 Каталог');
+    }
+  }
+
+  const range = encodeURIComponent(`'${targetSheet || '💎 Каталог'}'!A1:Z1000`);
+  const res = await fetchWithAuth(`https://sheets.googleapis.com/v4/spreadsheets/${targetId}/values/${range}`);
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error?.message || 'Не вдалося завантажити аркуш Каталогу');
+  }
+
+  const data = await res.json();
+  const rows: any[][] = data.values || [];
+  const catalog = parseCatalogRows(rows);
+
+  if (catalog.length > 0) {
+    saveLocalData({ catalog });
+  }
+
+  return catalog;
+}
+
 
 /**
  * Sync / Write All Data directly to Google Sheets
