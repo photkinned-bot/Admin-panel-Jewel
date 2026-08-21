@@ -1,0 +1,8 @@
+{
+  "name": "JewelMaster Pro",
+  "description": "Professional jewelry workshop management system with order tracking, material accounting, catalog, and Google Sheets integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
