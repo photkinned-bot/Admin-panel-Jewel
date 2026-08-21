@@ -6,14 +6,8 @@ import {defineConfig, loadEnv} from 'vite';
 export default defineConfig(({mode}) => {
   const env = loadEnv(mode, '.', '');
   
-  // Автоматичне визначення base URL для GitHub Pages
-  // Якщо збірка відбувається через GitHub Actions, використовуємо назву репозиторію
-  const repoName = process.env.GITHUB_REPOSITORY 
-    ? `/${process.env.GITHUB_REPOSITORY.split('/')[1]}/` 
-    : './';
-
   return {
-    base: repoName,
+    base: './',
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
